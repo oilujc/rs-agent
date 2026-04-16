@@ -38,8 +38,21 @@ impl OllamaClient {
             body["tools"] = serde_json::json!(request.tools);
         }
 
+        let mut options = serde_json::Map::new();
         if let Some(temp) = request.temperature {
-            body["temperature"] = serde_json::json!(temp);
+            options.insert("temperature".to_string(), serde_json::json!(temp));
+        }
+        if let Some(max_tokens) = request.max_tokens {
+            options.insert("num_predict".to_string(), serde_json::json!(max_tokens));
+        }
+        if !options.is_empty() {
+            body["options"] = serde_json::Value::Object(options);
+        }
+
+        if let Some(think) = request.think {
+            if think {
+                body["think"] = serde_json::json!(true);
+            }
         }
 
         body

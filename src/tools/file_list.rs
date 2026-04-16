@@ -1,13 +1,30 @@
+use std::path::PathBuf;
+
 use async_trait::async_trait;
 use serde_json::{json, Value};
+
 use crate::error::Result;
 use crate::tools::ToolExecutor;
 
-pub struct FileListTool;
+pub struct FileListTool {
+    workdir: Option<PathBuf>,
+}
 
 impl FileListTool {
     pub fn new() -> Self {
-        Self
+        Self { workdir: None }
+    }
+
+    pub fn with_workdir(mut self, workdir: PathBuf) -> Self {
+        self.workdir = Some(workdir);
+        self
+    }
+
+    fn resolve(&self, path: &str) -> Result<PathBuf> {
+        match &self.workdir {
+            Some(base) => crate::tools::resolve_path(base, path),
+            None => Ok(PathBuf::from(path)),
+        }
     }
 }
 
@@ -39,7 +56,9 @@ impl ToolExecutor for FileListTool {
             .as_str()
             .ok_or_else(|| crate::error::AgentForgeError::InvalidRequest("path must be a string".to_string()))?;
 
-        let mut entries = tokio::fs::read_dir(path)
+        let resolved = self.resolve(path)?;
+
+        let mut entries = tokio::fs::read_dir(&resolved)
             .await
             .map_err(|e| crate::error::AgentForgeError::ToolExecution(format!("Failed to read directory {}: {}", path, e)))?;
 

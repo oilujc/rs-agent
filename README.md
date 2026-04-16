@@ -1,23 +1,26 @@
 # agent-forge
 
-A Rust framework for building and running AI agents powered by local LLMs via [Ollama](https://ollama.com). agent-forge implements the [AG-UI](https://github.com/ag-ui-protocol/ag-ui) protocol for streaming agent events and provides a modular, extensible architecture for tool-augmented conversational agents.
+A Rust framework for building and running AI agents powered by LLMs via [Ollama](https://ollama.com) or [OpenRouter](https://openrouter.ai). agent-forge streams agent events in real-time through a channel and provides a modular, extensible architecture for tool-augmented conversational agents.
 
 ## Features
 
-- **Local-first** — connects to Ollama running on your machine; no cloud API keys required
-- **AG-UI compliant** — emits structured events (`StateSnapshot`, `StateDelta`, `TextMessageContent`, `ToolCallStart`, etc.) via an `mpsc` channel
+- **Multi-provider** — connect to Ollama (local) or OpenRouter (cloud API) with a single config switch
+- **Real-time streaming** — events stream through an `mpsc` channel as they happen (text deltas, thinking, tool calls, state changes)
+- **Thinking/reasoning support** — `--think` flag enables reasoning output for models like `deepseek-r1` (Ollama) or reasoning models on OpenRouter
 - **Multi-turn agentic loop** — automatically streams LLM responses, executes tool calls, feeds results back, and repeats up to a configurable round limit
-- **Session persistence** — thread-scoped `Session` with pluggable `SessionStore` (in-memory by default)
+- **Session persistence** — thread-scoped `Session` with pluggable `SessionStore` (in-memory or SQLite)
+- **Conversation summarization** — automatic summarization using a configurable `summary_model`, injected as `## Context` on subsequent runs
 - **Agent prompts from Markdown** — define agent behavior with structured `## Section` Markdown files
-- **Built-in file tools** — read, write, list directories, glob search, and regex grep; all opt-in
+- **Built-in file tools** — read, write, list, search, grep, and create directories; all sandboxed to an optional `workdir`
 - **Session-scoped memory** — `memory_set`/`memory_get` tools let agents persist key-value state across turns
+- **Tool deduplication & loop prevention** — signature-based dedup, file creation cap, and consecutive dedup detection prevent infinite tool-call loops
+- **Config file & CLI** — full configuration via JSON file with CLI flag overrides
 - **Builder pattern** — `AgentBuilder` and `Session` API for clean programmatic configuration
-- **CLI** — run agents from the command line with `agent-forge`
 
 ## Prerequisites
 
 - [Rust](https://www.rust-lang.org/tools/install) (edition 2024, latest stable)
-- [Ollama](https://ollama.com) running locally with at least one model pulled (e.g. `ollama pull llama3.2`)
+- [Ollama](https://ollama.com) running locally for local models, or an OpenRouter API key for cloud models
 
 ## Getting Started
 
@@ -30,7 +33,7 @@ cargo build
 ### Run via CLI
 
 ```bash
-# Simple one-shot message
+# Simple one-shot message (Ollama)
 agent-forge "Explain ownership in Rust"
 
 # Use a specific model
@@ -39,67 +42,121 @@ agent-forge --model codellama "Write a Fibonacci function"
 # Load a custom agent prompt from a Markdown file
 agent-forge --agent examples/agent.md --model llama3.2 "Refactor main.rs"
 
+# Use OpenRouter with a cloud model
+agent-forge --provider openrouter --api-key sk-or-... --model anthropic/claude-3.5-sonnet "message"
+
+# Enable thinking/reasoning for supported models
+agent-forge --think --model deepseek-r1 "Solve this puzzle"
+
+# Limit generation length
+agent-forge --max-tokens 4096 "Write a short poem"
+
+# Continue a conversation with a thread ID
+agent-forge --thread-id <uuid> "Now add error handling"
+
+# Use a config file
+agent-forge --config config.json "message"
+
 # Disable built-in file tools
 agent-forge --no-tools "What is 2+2?"
 
 # Set generation temperature
 agent-forge --temperature 0.3 "Write a haiku about programming"
-
-# Continue a conversation with a thread ID
-agent-forge --thread-id <uuid> "Now add error handling"
 ```
 
-All CLI options:
+### All CLI Options
 
 | Flag | Default | Description |
 |---|---|---|
 | `--agent` | — | Path to agent prompt Markdown file |
-| `--model` | `llama3.2` | Ollama model name |
-| `--url` | `http://localhost:11434` | Ollama base URL |
-| `--no-tools` | off | Disable built-in file system tools |
+| `--config` | — | Path to JSON config file |
+| `--provider` | `ollama` | LLM provider (`ollama` or `openrouter`) |
+| `--model` | `llama3.2` | Model name |
+| `--url` | `http://localhost:11434` | Provider base URL |
+| `--api-key` | — | API key for the provider (required for OpenRouter) |
 | `--temperature` | — | Sampling temperature |
+| `--max-tokens` | — | Maximum tokens to generate |
+| `--think` | off | Enable thinking/reasoning for supported models |
+| `--no-tools` | off | Disable built-in file system tools |
 | `--thread-id` | random | UUID thread ID for session persistence |
+| `--db-path` | — | Path to SQLite database for session persistence |
+| `--workdir` | — | Working directory for file tool sandboxing |
+| `--context-messages` | 3 | Number of recent messages to include in context |
+| `--no-summarize` | off | Disable conversation summarization |
 | `<message>` | required | The user message to send |
+
+### Config File
+
+```json
+{
+  "provider": {
+    "name": "ollama",
+    "model": "llama3.2",
+    "url": "http://localhost:11434",
+    "temperature": 0.7,
+    "max_tokens": null,
+    "summary_model": "llama3.2",
+    "api_key": null,
+    "think": false
+  },
+  "db_path": "./sessions.db",
+  "workdir": "./workspace",
+  "context_messages": 3,
+  "summarize": true
+}
+```
+
+CLI flags always override config file values. `--agent` and `--thread-id` are CLI-only.
 
 ## Architecture
 
 ```
 src/
-├── main.rs              # CLI entry point (clap)
-├── error.rs             # AgentForgeError enum, Result type alias
-├── agent_prompt.rs      # Parses ## Section Markdown into system prompts
-├── agent/
-│   ├── mod.rs           # Agent struct, session() / session_with_id() / run_once()
-│   └── builder.rs       # AgentBuilder (fluent API)
+├── main.rs              # CLI entry point (clap), event loop, stdout streaming
+├── config.rs           # Config + ProviderConfig, CLI override merging
+├── error.rs            # AgentForgeError enum
+├── event.rs            # Local Event enum, ID types (ThreadId, MessageId, ToolCallId), Role
+├── agent_prompt.rs     # Parses ## Section Markdown into system prompts
+├── summarizer.rs       # Summarizer — background summarization task
 ├── client/
-│   ├── mod.rs           # LlmClient trait, ChatRequest, Ollama types
-│   └── ollama.rs        # OllamaClient — streams NDJSON from /api/chat
+│   ├── mod.rs          # LlmClient trait, ChatRequest, create_client(), Ollama types
+│   ├── ollama.rs       # OllamaClient — NDJSON streaming, think support
+│   └── openrouter.rs   # OpenRouterClient — SSE streaming, tool call accumulation, reasoning_content
+├── agent/
+│   ├── mod.rs          # Agent struct, session_with_id()
+│   └── builder.rs      # AgentBuilder (fluent API)
 ├── session/
-│   └── mod.rs           # Session — core agentic loop, state, event emission
+│   ├── mod.rs          # Session, run_agentic_loop, deduplication, real-time event streaming
+│   └── sqlite_store.rs # SqliteSessionStore with summary column + migration
 ├── memory/
 │   └── mod.rs           # MemorySetTool / MemoryGetTool (session-scoped KV)
 └── tools/
-    ├── mod.rs           # ToolExecutor trait, ToolRegistry, ToolDefinition
-    ├── file_read.rs     # read_file tool
-    ├── file_write.rs    # write_file tool
-    ├── file_list.rs     # list_directory tool
-    └── file_search.rs   # search_files (glob) + grep_content (regex)
+    ├── mod.rs           # ToolExecutor trait, ToolRegistry, resolve_path(), resolve_path_allow_create()
+    ├── file_read.rs     # read_file tool with offset/limit/binary detection
+    ├── file_write.rs    # write_file tool with append mode
+    ├── file_list.rs     # list_directory tool with workdir sandboxing
+    ├── file_search.rs   # search_files (glob) + grep_content (regex) with workdir sandboxing
+    └── dir_create.rs    # create_directory tool with workdir sandboxing
 ```
 
-### Key flow
+### Key Flow
 
 1. `Agent::builder(client).model(...).tools(...).build()` creates an `Agent`
 2. `agent.session_with_id(thread_id)` creates a `Session` with per-session state and memory tools
-3. `session.run(user_message)` streams the LLM response, executes tool calls, feeds results back, and repeats for up to `max_rounds` (default: 10)
-4. Events are emitted through an `mpsc::UnboundedReceiver<Result<Event>>` channel following the AG-UI protocol
+3. `session.run(user_message)` pushes the user message, spawns the agentic loop as a `tokio::spawn` task, and returns the event channel **immediately**
+4. The spawned task streams events in real-time: LLM response → tool calls → loop → `RunFinished`
+5. After `RunFinished`, summarization and session persistence run as background tasks
 
-### AG-UI Events
+### Events
 
 The session emits these event types during a run:
 
 | Event | When |
 |---|---|
 | `RunStarted` | Beginning of the run |
+| `ThinkingTextMessageStart` | Start of thinking/reasoning output |
+| `ThinkingTextMessageContent` | Each thinking text delta |
+| `ThinkingTextMessageEnd` | End of thinking output |
 | `TextMessageStart` | Before streaming assistant text |
 | `TextMessageContent` | Each text delta from the LLM |
 | `TextMessageEnd` | After text streaming completes |
@@ -112,85 +169,30 @@ The session emits these event types during a run:
 | `RunFinished` | End of the run |
 | `RunError` | On errors |
 
-## Programmatic Usage
-
-```rust
-use std::sync::Arc;
-use agent_forge::client::ollama::OllamaClient;
-use agent_forge::agent::Agent;
-use agent_forge::tools::ToolRegistry;
-use futures::StreamExt;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = Arc::new(OllamaClient::new());
-    let tools = ToolRegistry::with_defaults();
-
-    let agent = Agent::builder(client)
-        .model("llama3.2")
-        .system_prompt("You are a helpful coding assistant.")
-        .tools(tools)
-        .build()?;
-
-    let mut session = agent.session();
-    let mut rx = session.run("Explain Rust's borrow checker").await?;
-
-    while let Some(event_result) = rx.next().await {
-        match event_result? {
-            ag_ui_core::event::Event::TextMessageContent(e) => print!("{}", e.delta),
-            ag_ui_core::event::Event::ToolCallStart(e) => eprintln!("\n[Calling: {}]", e.tool_call_name),
-            ag_ui_core::event::Event::RunFinished(_) => println!("\n[Done]"),
-            _ => {}
-        }
-    }
-
-    // Access session state
-    let state = session.state().await;
-    println!("State: {}", serde_json::to_string_pretty(&state)?);
-
-    Ok(())
-}
-```
-
 ## Built-in Tools
 
 | Tool | Description |
 |---|---|
-| `read_file` | Read a file's contents from the filesystem |
-| `write_file` | Write content to a file (creates or overwrites) |
+| `read_file` | Read a file's contents (supports offset/limit, binary detection) |
+| `write_file` | Write content to a file (creates, overwrites, or appends) |
 | `list_directory` | List files and subdirectories in a directory |
 | `search_files` | Search for files matching a glob pattern |
-| `grep_content` | Search file contents with regex (supports case-insensitive) |
+| `grep_content` | Search file contents with regex |
+| `create_directory` | Create a directory and any missing parent directories |
 | `memory_set` | Store a key-value pair in session memory |
 | `memory_get` | Retrieve a value from session memory by key |
 
 Note: `memory_set` and `memory_get` are injected per-session (not in `ToolRegistry::with_defaults()`) because they hold an `Arc<RwLock<Value>>` pointing to the session's state.
 
+## Tool Call Deduplication & Loop Prevention
+
+1. **Signature-based deduplication** — Tool calls are keyed by `(tool_name, path)` or key arguments. Duplicate calls return "Action already completed."
+2. **File creation cap** — After 2 successful `write_file`/`create_directory` calls, further file creation is blocked with "Task completed."
+3. **Consecutive dedup detection** — After 2 consecutive rounds where all calls are deduplicated, the loop breaks early.
+
 ## Agent Prompt Files
 
-Agent behavior is defined in Markdown files using `## Section` headers. Sections are concatenated into a system prompt in sorted order.
-
-Example (`examples/agent.md`):
-
-```markdown
-## Role
-You are an expert software development assistant.
-
-## Context
-- You have access to file system tools for reading, writing, listing, and searching files
-- You can store and recall information using memory tools across the conversation
-
-## Instructions
-- Always read relevant files before suggesting changes
-- Use memory_set to store important context about the project
-- Keep responses concise and actionable
-
-## Constraints
-- Never modify files outside the project directory
-- Always explain what a code change does before making it
-```
-
-If no `## Section` headers are present, the entire file content is used as a raw system prompt.
+Markdown files with `## Section` headers (e.g. `## Role`, `## Context`, `## Instructions`). Plain markdown with no headers falls back to raw system prompt. When summarization is active, `## Context` and `## Last messages` sections are appended automatically.
 
 ## Extending with Custom Tools
 
@@ -231,34 +233,34 @@ registry.register(MyTool);
 
 ## Session Persistence
 
-Sessions can be persisted using the `SessionStore` trait:
+Sessions can be persisted using the `SessionStore` trait with a built-in SQLite backend:
 
-```rust
-use agent_forge::session::{SessionStore, SessionData, InMemoryStore};
+```bash
+# Persist sessions to a SQLite database
+agent-forge --config config.json --db-path ./sessions.db "message"
 
-// Implement your own store (e.g., file-based, database):
-pub struct FileStore;
-
-impl SessionStore for FileStore {
-    fn save(&self, thread_id: &str, data: &SessionData) -> Result<()> {
-        // Serialize and write to disk
-    }
-
-    fn load(&self, thread_id: &str) -> Result<Option<SessionData>> {
-        // Read and deserialize from disk
-    }
-}
+# Continue a previous session
+agent-forge --config config.json --thread-id <uuid> "follow-up message"
 ```
 
-Pass a store to the agent builder via `.store(Arc::new(my_store))`. By default, sessions use `InMemoryStore` (no persistence across process restarts).
+Or programmatically:
+
+```rust
+use agent_forge::session::sqlite_store::SqliteSessionStore;
+use std::sync::Arc;
+
+let store = Arc::new(SqliteSessionStore::open("./sessions.db")?);
+let agent = Agent::builder(client)
+    .store(store)
+    .build()?;
+```
 
 ## Dependencies
 
 | Crate | Purpose |
 |---|---|
-| `ag-ui-core` | AG-UI protocol types and event definitions |
-| `reqwest` | HTTP client for Ollama API |
-| `tokio` | Async runtime |
+| `reqwest` | HTTP client for Ollama/OpenRouter APIs |
+| `tokio` | Async runtime, `tokio::spawn` for background tasks |
 | `serde` / `serde_json` | Serialization |
 | `async-trait` | Async trait support |
 | `futures` | Stream utilities and MPSC channel |
@@ -269,6 +271,7 @@ Pass a store to the agent builder via `.store(Arc::new(my_store))`. By default, 
 | `regex` | Regular expression search |
 | `json-patch` | State delta computation |
 | `parking_lot` | Synchronous `RwLock` for `SessionStore` |
+| `rusqlite` | SQLite for persistent session storage (bundled) |
 
 ## License
 

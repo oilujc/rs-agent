@@ -1,13 +1,37 @@
 pub mod ollama;
+pub mod openrouter;
 
 use std::pin::Pin;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::Stream;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::error::Result;
+use crate::config::ProviderConfig;
+use crate::error::{AgentForgeError, Result};
+
+pub fn create_client(provider: &ProviderConfig) -> Result<Arc<dyn LlmClient>> {
+    match provider.name.as_str() {
+        "ollama" => {
+            let client = ollama::OllamaClient::new().with_base_url(provider.url.clone());
+            Ok(Arc::new(client))
+        }
+        "openrouter" => {
+            let api_key = provider.api_key.as_ref().ok_or_else(|| {
+                AgentForgeError::Config("OpenRouter provider requires an 'api_key'".to_string())
+            })?;
+            let client = openrouter::OpenRouterClient::new(api_key.clone())
+                .with_base_url(provider.url.clone());
+            Ok(Arc::new(client))
+        }
+        name => Err(AgentForgeError::Config(format!(
+            "Unknown provider: '{}'. Available providers: ollama, openrouter",
+            name
+        ))),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ChatRequest {
@@ -16,6 +40,8 @@ pub struct ChatRequest {
     pub tools: Vec<Value>,
     pub stream: bool,
     pub temperature: Option<f32>,
+    pub max_tokens: Option<u32>,
+    pub think: Option<bool>,
 }
 
 impl ChatRequest {
@@ -26,6 +52,8 @@ impl ChatRequest {
             tools: Vec::new(),
             stream: true,
             temperature: None,
+            max_tokens: None,
+            think: None,
         }
     }
 
@@ -36,6 +64,16 @@ impl ChatRequest {
 
     pub fn with_temperature(mut self, temp: f32) -> Self {
         self.temperature = Some(temp);
+        self
+    }
+
+    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = Some(max_tokens);
+        self
+    }
+
+    pub fn with_think(mut self, think: bool) -> Self {
+        self.think = Some(think);
         self
     }
 }
@@ -85,12 +123,16 @@ pub struct OllamaMessage {
     pub role: String,
     #[serde(default)]
     pub content: String,
+    #[serde(default)]
+    pub thinking: Option<String>,
     #[serde(rename = "tool_calls", default)]
     pub tool_calls: Option<Vec<OllamaToolCall>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct OllamaToolCall {
+    #[serde(default)]
+    pub index: Option<usize>,
     pub function: OllamaFunction,
 }
 

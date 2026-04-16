@@ -28,6 +28,9 @@ pub enum AgentForgeError {
 
     #[error("Invalid request: {0}")]
     InvalidRequest(String),
+
+    #[error("SQLite error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
 }
 
 pub type Result<T> = std::result::Result<T, AgentForgeError>;

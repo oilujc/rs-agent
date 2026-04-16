@@ -1,16 +1,32 @@
+use std::path::PathBuf;
+
 use async_trait::async_trait;
 use glob::glob;
 use regex::Regex;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+
 use crate::error::Result;
 use crate::tools::ToolExecutor;
 
-pub struct FileSearchTool;
+pub struct FileSearchTool {
+    workdir: Option<PathBuf>,
+}
 
 impl FileSearchTool {
     pub fn new() -> Self {
-        Self
+        Self { workdir: None }
+    }
+
+    pub fn with_workdir(mut self, workdir: PathBuf) -> Self {
+        self.workdir = Some(workdir);
+        self
+    }
+
+    fn resolve(&self, path: &str) -> Result<PathBuf> {
+        match &self.workdir {
+            Some(base) => crate::tools::resolve_path(base, path),
+            None => Ok(PathBuf::from(path)),
+        }
     }
 }
 
@@ -50,10 +66,12 @@ impl ToolExecutor for FileSearchTool {
             .as_str()
             .unwrap_or(".");
 
+        let base = self.resolve(base_path)?;
+
         let search_pattern = if pattern.starts_with('/') {
             pattern.to_string()
         } else {
-            format!("{}/{}", base_path.trim_end_matches('/'), pattern)
+            format!("{}/{}", base.display(), pattern)
         };
 
         let matches: Vec<String> = glob(&search_pattern)
@@ -70,11 +88,25 @@ impl ToolExecutor for FileSearchTool {
     }
 }
 
-pub struct GrepContentTool;
+pub struct GrepContentTool {
+    workdir: Option<PathBuf>,
+}
 
 impl GrepContentTool {
     pub fn new() -> Self {
-        Self
+        Self { workdir: None }
+    }
+
+    pub fn with_workdir(mut self, workdir: PathBuf) -> Self {
+        self.workdir = Some(workdir);
+        self
+    }
+
+    fn resolve(&self, path: &str) -> Result<PathBuf> {
+        match &self.workdir {
+            Some(base) => crate::tools::resolve_path(base, path),
+            None => Ok(PathBuf::from(path)),
+        }
     }
 }
 
@@ -131,7 +163,7 @@ impl ToolExecutor for GrepContentTool {
         let re = Regex::new(&regex_pattern)
             .map_err(|e| crate::error::AgentForgeError::ToolExecution(format!("Invalid regex pattern: {}", e)))?;
 
-        let search_path = PathBuf::from(path);
+        let search_path = self.resolve(path)?;
         let mut results = Vec::new();
 
         if search_path.is_file() {
@@ -144,25 +176,25 @@ impl ToolExecutor for GrepContentTool {
             }
         } else if search_path.is_dir() {
             let mut stack = vec![search_path.clone()];
-            
+
             while let Some(current_dir) = stack.pop() {
                 let mut entries = tokio::fs::read_dir(&current_dir)
                     .await
                     .map_err(|e| crate::error::AgentForgeError::ToolExecution(format!("Failed to read directory: {}", e)))?;
 
                 while let Some(entry) = entries.next_entry().await.map_err(|e| crate::error::AgentForgeError::ToolExecution(format!("Failed to read entry: {}", e)))? {
-                    let path = entry.path();
-                    
-                    if path.is_dir() {
-                        if let Some(name) = path.file_name().map(|n| n.to_string_lossy().to_string()) {
+                    let entry_path = entry.path();
+
+                    if entry_path.is_dir() {
+                        if let Some(name) = entry_path.file_name().map(|n| n.to_string_lossy().to_string()) {
                             if !name.starts_with('.') {
-                                stack.push(path);
+                                stack.push(entry_path);
                             }
                         }
-                    } else if let Ok(content) = tokio::fs::read_to_string(&path).await {
+                    } else if let Ok(content) = tokio::fs::read_to_string(&entry_path).await {
                         for (line_num, line) in content.lines().enumerate() {
                             if re.is_match(line) {
-                                results.push(format!("{}:{}: {}", path.display(), line_num + 1, line));
+                                results.push(format!("{}:{}: {}", entry_path.display(), line_num + 1, line));
                             }
                         }
                     }
